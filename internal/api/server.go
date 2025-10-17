@@ -1,9 +1,12 @@
 package api
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -66,6 +69,8 @@ func (s *Server) setupRoutes() {
 	r := mux.NewRouter()
 
 	// Apply global middleware
+	// gzip should be near the top so we can compress responses from downstream handlers
+	r.Use(s.gzipMiddleware)
 	r.Use(s.loggingMiddleware)
 	r.Use(s.corsMiddleware)
 	r.Use(s.authMiddleware.CheckAuthStatus())
@@ -223,6 +228,9 @@ func (s *Server) createFrontendHandler(fs http.FileSystem) http.HandlerFunc {
 				return
 			}
 
+			// Set appropriate cache headers for static assets
+			s.setCacheHeadersForPath(w, path)
+
 			http.ServeContent(w, r, path, stat.ModTime(), file)
 			return
 		}
@@ -284,4 +292,47 @@ func (s *Server) respondJSON(w http.ResponseWriter, status int, data any) {
 
 func (s *Server) respondError(w http.ResponseWriter, status int, message string) {
 	s.respondJSON(w, status, map[string]string{"error": message})
+}
+
+// gzipResponseWriter wraps http.ResponseWriter to provide gzip compression
+type gzipResponseWriter struct {
+	io.Writer
+	http.ResponseWriter
+}
+
+func (w gzipResponseWriter) Write(b []byte) (int, error) {
+	return w.Writer.Write(b)
+}
+
+// gzipMiddleware compresses responses when client supports gzip
+func (s *Server) gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Set header to indicate gzip encoding
+		w.Header().Set("Content-Encoding", "gzip")
+
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+
+		gw := gzipResponseWriter{Writer: gz, ResponseWriter: w}
+		next.ServeHTTP(gw, r)
+	})
+}
+
+// setCacheHeadersForPath applies caching headers for static assets based on extension
+func (s *Server) setCacheHeadersForPath(w http.ResponseWriter, path string) {
+	// Long cache for fingerprinted assets (contains a dot-separated hash) and common static types
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".js", ".css", ".png", ".jpg", ".jpeg", ".svg", ".webp", ".woff2", ".woff", ".ico":
+		// Public immutable cache for 365 days
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	default:
+		// Shorter cache for others
+		w.Header().Set("Cache-Control", "public, max-age=300")
+	}
 }
